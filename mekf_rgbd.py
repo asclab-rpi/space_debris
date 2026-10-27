@@ -13,6 +13,12 @@ notations
     t: ground truth value
     n: noisy value
 
+frame convention
+    C: camera frame (never moves, serves as inertial frame)
+    B: body-fixed axes based on geometry of satellite model
+    B': body-fixed axes that line up with C at t=0 (B' = R0*B)
+
+
 GLobal state: x = [q, omega, p]
 parameters: p = [p1 = Iyy/Ixx, 
                 p2 = Izz/Ixx, 
@@ -125,32 +131,28 @@ plt.show()
 # define functions
 
 # measurement function
-"""def h(omega_hat_interval):
-    
-    Returns z_hat, size 4
-    average of predicted ang velocity from previous timestep
-    
-    
-    omega_pred = omega_hat_interval
-
-    # trapezoidal
-    omega_avg = (0.5*(omega_pred[0] + omega_pred[-1]) + omega_pred[1:-1].sum(0)) / rate_ratio
-
-
-    return omega_avg"""
-
+def h(x_interval):
+    """
+    inputs current estimates of q (B' -> C) and omega (B') across interval (of most recent omega values up to last measurement update)
+    converts q to Rotation matrix
+    multiplies by omega to rotate into C frame
+    returns average omega across interval
+    """
+    v = np.array([Rmat(x[:4]) @ x[4:7] for x in x_interval])          # inertial-frame omega at each step
+    return (0.5*(v[0] + v[-1]) + v[1:-1].sum(0)) / rate_ratio          # trapezoid average
 
 def H_jac(x_hat):
     """
-    Jacobian of h(x_hat) wrt error state
-    Only the 3x3 omega block is nonzero
+    Jacobian of h(x_interval) wrt error state
     Returns H shape 3 x 11
     """
-    
+
+    Rq = Rmat(x_hat[:4])
     H = np.zeros((dim_z_err, dim_x_err))
-    H[:,3:6] = np.eye(3)
-    
+    H[:, 0:3] = -Rq @ skew_symmetric(x_hat[4:7])                      
+    H[:, 3:6] = Rq                                                    
     return H
+
 
 
 def F_jac(x_hat_old, eps=1e-6):
@@ -221,50 +223,6 @@ def f(x):
     return x_new
 
 
-"""def _state_deriv(q, omega, p):
-    
-    Returns (q_dot, omega_dot) for the coupled (q, omega) system.
-    p is held fixed within a propagation step (parameters have no
-    dynamics of their own -- they only move via the EKF correction).
-    
-    q_dot = 0.5 * W_body(q).T @ omega          # eq from [6]
-    omega_dot = calc_omega_dot(omega, p)        # general Euler rotation eq
-    return q_dot, omega_dot
-
-
-def f2(x):
-    
-    Nonlinear state propagation, one dt step, via classical RK4.
-    parameters held constant (affected only by Q, not f)
-    
-    RK4 is used instead of forward Euler because forward Euler has
-    O(dt) local error and no stability margin: if the current inertia-
-    parameter estimate is far from truth (e.g. early in convergence),
-    the resulting omega_dot can be large/stiff, and Euler integration
-    of that stiff ODE diverges outright rather than just being
-    inaccurate. RK4 (O(dt^4) local error, much larger stability region)
-    stays accurate and bounded under the same dt.
-    
-    q = x[:4]
-    omega = x[4:7]
-    p = x[7:]
-    
-    k1_q, k1_w = _state_deriv(q, omega, p)
-    k2_q, k2_w = _state_deriv(q + 0.5 * dt * k1_q, omega + 0.5 * dt * k1_w, p)
-    k3_q, k3_w = _state_deriv(q + 0.5 * dt * k2_q, omega + 0.5 * dt * k2_w, p)
-    k4_q, k4_w = _state_deriv(q + dt * k3_q, omega + dt * k3_w, p)
-    
-    q_new = q + (dt / 6.0) * (k1_q + 2 * k2_q + 2 * k3_q + k4_q)
-    q_new /= np.linalg.norm(q_new)
-    
-    omega_new = omega + (dt / 6.0) * (k1_w + 2 * k2_w + 2 * k3_w + k4_w)
-    
-    x_new = np.empty_like(x)
-    x_new[:4]  = q_new
-    x_new[4:7] = omega_new
-    x_new[7:]  = x[7:]     # parameters unchanged in propagation
-    return x_new
-    """
 
 def calc_omega_dot(omega, p):
     """
@@ -320,15 +278,20 @@ def inertia_tensor_to_parameters(I):
         ])
 
  
-# physical-validity helpers (used by the PD guard in the update step)
 def inertia_from_p(p):
+    """
+    converts parameters back to 3x3 intertia tensor
+    """
     p1, p2, p3, p4, p5 = p
     return np.array([[1, -p3, -p4], 
                      [-p3, p1, -p5], 
                      [-p4, -p5, p2]])
 
 def is_pd(I_mat, min_eig=0.1, max_cond=1e3):
-    """True if I_mat is a physically valid AND well-conditioned inertia tensor
+    """
+    physical-validity helper (used by the PD guard in the update step)
+
+    True if I_mat is a physically valid AND well-conditioned inertia tensor
     (eigenvalues > 0 with a real margin, not just nominally positive)."""
     try:
         ev = np.linalg.eigvalsh(I_mat)
@@ -338,17 +301,6 @@ def is_pd(I_mat, min_eig=0.1, max_cond=1e3):
 
 def Rmat(q):
     return quaternion.as_rotation_matrix(np.quaternion(*q))
-
-def h(x_interval):
-    v = np.array([Rmat(x[:4]) @ x[4:7] for x in x_interval])          # inertial-frame ω at each step
-    return (0.5*(v[0] + v[-1]) + v[1:-1].sum(0)) / rate_ratio          # trapezoid average
-
-def H_jac(x_hat):
-    Rq = Rmat(x_hat[:4])
-    H = np.zeros((3, dim_x_err))
-    H[:, 0:3] = -Rq @ skew_symmetric(x_hat[4:7])                       # d/dα
-    H[:, 3:6] = Rq                                                     # d/dδω
-    return H
 
 
 
@@ -374,7 +326,7 @@ Q[6:,6:] *= sigma_Q_p**2
 # measurement noise matrix R
 sigma_R = 0.07
 
-omega_cam_true_sample = np.array([omega_true[stride*j : stride*(j+1)+1].mean(0) for j in range(len(omega_cam_meas))])
+omega_cam_true_sample = np.array([omega_cam_true[stride*j : stride*(j+1)+1].mean(0) for j in range(len(omega_cam_meas))])
 R_omega = np.diag(np.var((omega_cam_meas - omega_cam_true_sample)[pair_valid], axis=0))
 
 R = R_omega
@@ -453,24 +405,10 @@ S = np.empty((M, dim_z_err, dim_z_err))
 K = np.empty((M, dim_x_err, dim_z_err))
 
 
-# stability/convergence check
-p_check = np.empty((1, dim_p))
-stable_array = np.array([False, False, False, False, False])
-stable = False
-
-# values to tweak
-tol = 0.2 #sigma_Q_p*2
-sigma_Q_stable = 1e-6
-window = 300 # s, length of sliding time window that is checked for convergence
-
 # load array of valid measurements from script 85
 valid_meas = np.load(OUTPUT/"meas_valid.npy")
 
-# set up innovation gate
-GATE = 11.34          # chi-square, 3 dof, 99 %
-n_reject = 0
 
-d2_log = np.full(M, np.nan)
 
 
 #%% 
@@ -510,14 +448,10 @@ for k in range(1,N):
         w_avg = h(x_hat_interval)
         y = omega_cam_meas[j] - w_avg
 
+
         q_hat = np.quaternion(*x_hat[k, 0:4])
 
-        """q_m = np.quaternion(*z[k_m])
-        q_hat = np.quaternion(*h(x_hat[k]))
-        dq_m = 1/q_hat * q_m
-
-        # convert to rotation vector
-        y = 2*np.array([dq_m.x, dq_m.y, dq_m.z]) # small-angle attitude error"""
+        
 
         # measurement matrix
         H[k_m] = H_jac(x_hat[k])
@@ -525,20 +459,7 @@ for k in range(1,N):
         # innovation/residual covariance
         S[k_m] = H[k_m] @ P[k] @ H[k_m].T + R
 
-
-        # innovation gate
-        d2 = y @ np.linalg.solve(S[k_m], y)    # Mahalanobis distance^2
         
-        """print(d2)
-
-        if d2 > GATE:
-            n_reject += 1
-            if n_reject < 5:
-                continue
-            P[k][3:6, 3:6] += np.eye(3) * 0.05**2     # widen the ω covariance and accept
-            S[k_m] = H[k_m] @ P[k] @ H[k_m].T + R
-        n_reject = 0"""
-
         
         # Kalman gain
         K[k_m] = P[k] @ H[k_m].T @ np.linalg.inv(S[k_m])
@@ -549,19 +470,10 @@ for k in range(1,N):
         # compute correction
         dx_hat[k_m] = K[k_m] @ y      # estimated attitude error [0:3], omega error [3:6], inertia parameter error [6:11]
 
-        """# --- bound a single update's omega / parameter correction ---
-        # (attitude correction alpha is left alone). The gain is only trustworthy
-        # once P has been shaped by real data; during the first seconds a noisy
-        # residual can otherwise yank omega/p far from the physical region.
-        # Typical steady-state corrections here are ~1e-3, so this only ever
-        # bites during start-up.
-        cap_omega, cap_p = 0.05, 0.1
-        dx_hat[k_m, 3:6]  = np.clip(dx_hat[k_m, 3:6],  -cap_omega, cap_omega)
-        dx_hat[k_m, 6:11] = np.clip(dx_hat[k_m, 6:11], -cap_p, cap_p)
-"""
         
-        # --- PD guard (insurance): shrink the parameter correction until the
-        # resulting inertia tensor is physically valid and well-conditioned ---
+        
+        # PD guard (insurance): shrink the parameter correction until the
+        # resulting inertia tensor is physically valid and well-conditioned 
         p_old, dp_full = x_hat[k, 7:12], dx_hat[k_m, 6:11]
         if not is_pd(inertia_from_p(p_old + dp_full)):
             lo, hi = 0.0, 1.0
@@ -710,10 +622,3 @@ plt.show()
 
 # %%
 
-from scipy.spatial.transform import Rotation
-
-Rt = quaternion.as_rotation_matrix(quaternion.as_quat_array(q_true[::stride]))
-w_true_cam = Rotation.from_matrix(np.einsum('nij,nkj->nik', Rt[1:], Rt[:-1])).as_rotvec() / (stride*dt)
-
-
-plt.plot(np.linalg.norm(omega_cam_meas - w_true_cam, axis=1))
